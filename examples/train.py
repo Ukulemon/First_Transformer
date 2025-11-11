@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import sys
 from dataclasses import asdict
@@ -96,19 +97,27 @@ class PrefixDataset(Dataset[Tuple[Tensor, Tensor, Tensor]]):
         self.samples: List[List[int]] = []
 
         for text in texts:
-            if not text:
-                continue
-            token_ids = tokenizer.encode(text)
-            if len(token_ids) + 2 > max_length:
-                # Skip sequences that exceed our modeling capacity.
-                continue
-            full_sequence = [tokenizer.bos_id] + token_ids + [tokenizer.eos_id]
-            if len(full_sequence) < 3:
-                continue
-            self.samples.append(full_sequence)
+            sequence = self.build_sequence(text, tokenizer, max_length)
+            if sequence is not None:
+                self.samples.append(sequence)
 
         if not self.samples:
             raise ValueError("No valid training samples were created. Check your data or max_length.")
+
+    @staticmethod
+    def build_sequence(
+        text: str, tokenizer: CharTokenizer, max_length: int
+    ) -> List[int] | None:
+        if not text:
+            return None
+        token_ids = tokenizer.encode(text)
+        if len(token_ids) + 2 > max_length:
+            # Skip sequences that exceed our modeling capacity.
+            return None
+        full_sequence = [tokenizer.bos_id] + token_ids + [tokenizer.eos_id]
+        if len(full_sequence) < 3:
+            return None
+        return full_sequence
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -200,15 +209,16 @@ def train(args: argparse.Namespace) -> None:
 
     texts = load_texts(args.data)
     tokenizer = CharTokenizer(texts)
-    dataset = PrefixDataset(texts, tokenizer, max_length=args.max_length)
 
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=lambda batch: collate_fn(batch, tokenizer.pad_id),
-    )
+    valid_texts = [
+        text
+        for text in texts
+        if PrefixDataset.build_sequence(text, tokenizer, args.max_length) is not None
+    ]
+    if len(valid_texts) < 2:
+        raise ValueError(
+            "At least two valid texts shorter than max_length are required to create train/test splits."
+        )
 
     config = TransformerConfig(
         vocab_size=len(tokenizer),
@@ -232,11 +242,38 @@ def train(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     global_step = 0
-    loss_history: List[Tuple[int, float]] = []
+    eval_history: List[Tuple[int, float]] = []
     for epoch in range(1, args.epochs + 1):
+        indices = list(range(len(valid_texts)))
+        random.shuffle(indices)
+        num_test = max(1, math.ceil(len(valid_texts) / 10))
+        if num_test >= len(valid_texts):
+            num_test = len(valid_texts) - 1
+
+        test_indices = set(indices[:num_test])
+        train_texts = [valid_texts[i] for i in indices if i not in test_indices]
+        test_texts = [valid_texts[i] for i in test_indices]
+
+        train_dataset = PrefixDataset(train_texts, tokenizer, max_length=args.max_length)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=lambda batch: collate_fn(batch, tokenizer.pad_id),
+        )
+        test_dataset = PrefixDataset(test_texts, tokenizer, max_length=args.max_length)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=lambda batch: collate_fn(batch, tokenizer.pad_id),
+        )
+
         model.train()
         running_loss = 0.0
-        for batch in dataloader:
+        for batch in train_loader:
             src = batch["src"].to(device)
             tgt_in = batch["tgt_in"].to(device)
             tgt_out = batch["tgt_out"].to(device)
@@ -253,11 +290,39 @@ def train(args: argparse.Namespace) -> None:
 
             running_loss += loss.item()
             global_step += 1
-            if global_step % args.log_every == 0:
+            if args.log_every > 0 and global_step % args.log_every == 0:
                 avg_loss = running_loss / args.log_every
-                loss_history.append((global_step, avg_loss))
                 print(f"Epoch {epoch} Step {global_step}: loss={avg_loss:.4f}")
                 running_loss = 0.0
+
+        model.eval()
+        eval_loss = 0.0
+        eval_tokens = 0
+        with torch.no_grad():
+            for batch in test_loader:
+                src = batch["src"].to(device)
+                tgt_in = batch["tgt_in"].to(device)
+                tgt_out = batch["tgt_out"].to(device)
+                src_mask = batch["src_mask"].to(device)
+                tgt_mask = batch["tgt_mask"].to(device)
+
+                logits, _ = model(
+                    src,
+                    tgt_in,
+                    src_mask=src_mask,
+                    tgt_mask=tgt_mask,
+                    memory_mask=src_mask,
+                )
+                loss = criterion(logits.view(-1, logits.size(-1)), tgt_out.view(-1))
+                tokens = tgt_out.ne(tokenizer.pad_id).sum().item()
+                if tokens == 0:
+                    continue
+                eval_loss += loss.item() * tokens
+                eval_tokens += tokens
+
+        epoch_loss = eval_loss / eval_tokens if eval_tokens > 0 else float("nan")
+        eval_history.append((epoch, epoch_loss))
+        print(f"Epoch {epoch}: test_loss={epoch_loss:.4f}")
 
     checkpoint = {
         "model_state_dict": model.state_dict(),
@@ -272,11 +337,11 @@ def train(args: argparse.Namespace) -> None:
     }
     with (output_dir / "training_config.json").open("w", encoding="utf-8") as fh:
         json.dump(args_payload, fh, ensure_ascii=False, indent=2)
-    if loss_history:
+    if eval_history:
         with (output_dir / "loss_history.csv").open("w", encoding="utf-8", newline="") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["step", "loss"])
-            writer.writerows(loss_history)
+            writer.writerow(["epoch", "test_loss"])
+            writer.writerows(eval_history)
     print(f"Training complete. Checkpoint saved to {ckpt_path}")
 
 
