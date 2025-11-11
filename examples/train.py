@@ -170,9 +170,20 @@ def load_texts(path: Path) -> List[str]:
 
 
 def choose_device(requested: str | None) -> torch.device:
-    if requested:
-        return torch.device(requested)
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested is None:
+        requested = "auto"
+
+    normalized = requested.lower()
+    if normalized == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if normalized in {"gpu", "cuda"}:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available on this machine")
+        return torch.device("cuda")
+    if normalized == "cpu":
+        return torch.device("cpu")
+
+    return torch.device(requested)
 
 
 def set_seed(seed: int) -> None:
@@ -184,6 +195,7 @@ def set_seed(seed: int) -> None:
 
 def train(args: argparse.Namespace) -> None:
     device = choose_device(args.device)
+    print(f"Using device: {device}")
     set_seed(args.seed)
 
     texts = load_texts(args.data)
@@ -271,6 +283,7 @@ def train(args: argparse.Namespace) -> None:
 @torch.no_grad()
 def generate(args: argparse.Namespace) -> None:
     device = choose_device(args.device)
+    print(f"Using device: {device}")
     checkpoint = torch.load(args.checkpoint, map_location=device)
     config = TransformerConfig(**checkpoint["config"])
     model = TransformerModel(config).to(device)
@@ -335,14 +348,24 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--log-every", type=int, default=50, help="Steps between logging training loss")
     train_parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker processes")
     train_parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    train_parser.add_argument("--device", type=str, default=None, help="torch device string (default: auto)" )
+    train_parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to use: 'auto' (default, prefers GPU), 'cpu', 'cuda', or any torch device string",
+    )
 
     generate_parser = subparsers.add_parser("generate", help="Run inference with a trained checkpoint")
     generate_parser.add_argument("--checkpoint", type=Path, required=True, help="Path to the saved model checkpoint")
     generate_parser.add_argument("--tokenizer", type=Path, required=True, help="Path to the saved tokenizer JSON")
     generate_parser.add_argument("--prompt", type=str, required=True, help="Prompt text to continue")
     generate_parser.add_argument("--max-new-tokens", type=int, default=128, help="Maximum number of new tokens to generate")
-    generate_parser.add_argument("--device", type=str, default=None, help="torch device string (default: auto)")
+    generate_parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to use: 'auto' (default, prefers GPU), 'cpu', 'cuda', or any torch device string",
+    )
     generate_parser.add_argument(
         "--output",
         type=Path,
